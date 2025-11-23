@@ -1,0 +1,43 @@
+<mujoco model="scene">
+
+  <compiler angle="degree" coordinate="local"/>
+  <option timestep="0.002"/>
+
+  <!-- Assets: meshes, textures -->
+  <!-- Include the robot model -->
+  <include file="jaco2.xml"/> 
+  
+  <asset>
+    <mesh name="bowl_mesh" file="./assets/bowl.obj" scale="1 1 1"/>
+  </asset>
+
+  <!-- World definition -->
+  <worldbody>
+    <!-- Ground plane -->
+    <geom name="floor" type="plane" size="3 3 0.1" rgba="0.4 0.55 0.4 1"/>
+
+    <!-- Table -->
+    <body name="table" pos="0.4 0 0">
+      <geom type="box" size="0.35 0.35 0.5" rgba="00.2 0.2 0.25 1"/>
+    </body>
+
+    <!-- Box -->
+    <body name="box" pos="0.4 0.01 0.5">
+      <geom type="box" size="0.04 0.04 0.04" rgba="0.8 0.1 0.1 1"/>
+      <joint type="free"/>
+    </body>
+
+    <!-- sphere -->
+    <body name="sphere" pos="0.4 0 0.5">
+      <geom type="sphere" size="0.075" rgba="0.2 0.4 0.7 1"/>
+      <joint type="free"/>
+    </body>
+
+    <!-- Bowl (mesh) -->
+    <body name="bowl" pos="0.4 -0.01 0.5">
+        <geom type="mesh" mesh="bowl_mesh" mass="0.2" rgba="0.1 0.8 0.1 1"/>
+        <joint type="free"/>
+    </body>
+  
+  </worldbody>
+</mujoco>

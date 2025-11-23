@@ -1,0 +1,21 @@
+Sun Sep  7 11:51:58 2025
+ERROR: could not create window
+
+Sun Sep  7 11:55:55 2025
+ERROR: could not create window
+
+Sat Sep 13 22:52:57 2025
+ERROR: could not create window
+
+Sat Sep 13 22:58:01 2025
+ERROR: could not create window
+
+Sat Sep 13 22:59:10 2025
+ERROR: could not create window
+
+Sat Sep 13 22:59:42 2025
+ERROR: could not create window
+
+Sun Sep 14 11:16:40 2025
+ERROR: could not create window
+
