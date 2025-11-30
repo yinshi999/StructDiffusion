@@ -512,6 +512,44 @@ class SemanticArrangementDataset(torch.utils.data.Dataset):
 
         return tensor_x
 
+    @staticmethod
+    def get_mujoco_raw_data(model, data, target_object_names, goal_specification, 
+                            other_object_names=None, camera_name=None, num_pts=1024,
+                            max_num_target_objects=11, max_num_distractor_objects=5,
+                            use_virtual_structure_frame=True, ignore_distractor_objects=True,
+                            ignore_rgb=True, width=640, height=480):
+        """
+        Convenience method to get raw data from MuJoCo scene.
+        This is a wrapper around the mujoco_to_repo_converter function.
+        
+        Args:
+            model: MuJoCo model
+            data: MuJoCo data
+            target_object_names: List of target object names
+            goal_specification: Goal specification dictionary
+            other_object_names: List of other object names
+            camera_name: Camera name
+            num_pts: Number of points per object
+            max_num_target_objects: Maximum number of target objects
+            max_num_distractor_objects: Maximum number of distractor objects
+            use_virtual_structure_frame: Whether to use virtual structure frame
+            ignore_distractor_objects: Whether to ignore distractor objects
+            ignore_rgb: Whether to ignore RGB
+            width: Image width
+            height: Image height
+        
+        Returns:
+            Dictionary in same format as get_raw_data()
+        """
+        from StructDiffusion.utils.mujoco_to_repo_converter import get_mujoco_raw_data as _get_mujoco_raw_data
+        return _get_mujoco_raw_data(
+            model, data, target_object_names, goal_specification,
+            other_object_names, camera_name, num_pts,
+            max_num_target_objects, max_num_distractor_objects,
+            use_virtual_structure_frame, ignore_distractor_objects,
+            ignore_rgb, width, height
+        )
+
 
 def compute_min_max(dataloader):
 
