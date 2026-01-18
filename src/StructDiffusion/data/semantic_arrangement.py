@@ -8,6 +8,7 @@ import torch
 from tqdm import tqdm
 import json
 import random
+import mujoco
 
 from torch.utils.data import DataLoader
 
@@ -209,6 +210,122 @@ class SemanticArrangementDataset(torch.utils.data.Dataset):
                 ids[k[3:]] = h5[k][()]
         return ids
 
+    def _load_mesh_and_sample_pc(self, mesh_path, num_pts, apply_transform=None):
+        """
+        Load mesh from OBJ file and sample point cloud from it.
+        
+        @param mesh_path: Path to the .obj file
+        @param num_pts: Number of points to sample
+        @param apply_transform: Optional 4x4 transformation matrix to apply to the points
+        @return: Point cloud tensor of shape (num_pts, 3)
+        """
+        try:
+            # Load mesh from OBJ file
+            mesh = trimesh.load(mesh_path, force='mesh')
+            
+            # Sample points on the surface (uniform by area)
+            points, face_indices = trimesh.sample.sample_surface(mesh, count=num_pts)
+            
+            # Apply transformation if provided
+            if apply_transform is not None:
+                points = trimesh.transform_points(points, apply_transform)
+            
+            # Convert to tensor
+            points_tensor = torch.FloatTensor(points)
+            
+            return points_tensor
+        except Exception as e:
+            print(f"Error loading mesh from {mesh_path}: {e}")
+            # Return random points as fallback
+            return torch.randn(num_pts, 3) * 0.1
+    
+    def _get_mesh_path_for_object(self, h5, obj_name, base_mesh_dir="mujoco/meshes/assets"):
+        """
+        Get the mesh file path for an object. 
+        
+        First tries to read from h5 file if available, otherwise constructs path from object name.
+        
+        @param h5: HDF5 file handle
+        @param obj_name: Object name
+        @param base_mesh_dir: Base directory for mesh files
+        @return: Path to mesh file
+        """
+        # Try to get mesh path from h5 file
+        mesh_path_key = f"{obj_name}_mesh_path"
+        if mesh_path_key in h5.keys():
+            return str(np.array(h5[mesh_path_key]))
+        
+        # Try to extract object type from goal_specification
+        try:
+            goal_specification = json.loads(str(np.array(h5["goal_specification"])))
+            # Look for object in rearrange, anchor, or distract lists
+            for category in ['rearrange', 'anchor', 'distract']:
+                if category in goal_specification:
+                    for obj_spec in goal_specification[category]['objects']:
+                        if isinstance(obj_spec, dict) and 'mesh' in obj_spec:
+                            # Assume mesh file is named after object type
+                            mesh_filename = obj_spec['mesh']
+                            # Construct full path
+                            import os
+                            # Get the directory of the h5 file
+                            h5_dir = os.path.dirname(h5.filename)
+                            # Go up to the repo root and construct path
+                            repo_root = os.path.dirname(os.path.dirname(os.path.dirname(h5_dir)))
+                            return os.path.join(repo_root, base_mesh_dir, mesh_filename)
+        except:
+            pass
+        
+        # Fallback: construct path from object name (assuming object type is in the name)
+        # For example: "object_0" might map to "bowl.obj" or similar
+        # This is a placeholder - you should customize based on your naming convention
+        import os
+        h5_dir = os.path.dirname(h5.filename) if hasattr(h5, 'filename') else "."
+        repo_root = os.path.dirname(os.path.dirname(os.path.dirname(h5_dir)))
+        
+        # Default to bowl.obj as example (you should modify this based on your data)
+        default_mesh = "bowl.obj"
+        return os.path.join(repo_root, base_mesh_dir, default_mesh)
+    
+    def _get_mesh_path_from_mujoco(self, model, body_name, scene_xml_dir="."):
+        """
+        Get the mesh file path for an object from MuJoCo model.
+        
+        @param model: MuJoCo model
+        @param body_name: Body name in MuJoCo scene
+        @param scene_xml_dir: Directory where the scene XML is located
+        @return: Path to mesh file or None if not a mesh geom
+        """
+        try:
+            # Find the body
+            body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, body_name)
+            if body_id < 0:
+                return None
+            
+            # Find geoms belonging to this body
+            for geom_id in range(model.ngeom):
+                if model.geom_bodyid[geom_id] == body_id:
+                    geom_type = model.geom_type[geom_id]
+                    
+                    # Check if it's a mesh geom
+                    if geom_type == mujoco.mjtGeom.mjGEOM_MESH:
+                        mesh_id = model.geom_dataid[geom_id]
+                        # Get mesh file path from model
+                        # MuJoCo stores mesh paths in the compiled model
+                        # We need to extract it from the mesh name and asset path
+                        mesh_name_adr = model.name_meshadr[mesh_id]
+                        mesh_name = model.names[mesh_name_adr:].decode('utf-8').split('\x00')[0]
+                        
+                        # Find corresponding asset file
+                        # The mesh file is typically defined in the XML <asset> section
+                        # For now, construct path from mesh name
+                        mesh_filename = f"{mesh_name.replace('_mesh', '')}.obj"
+                        return os.path.join(scene_xml_dir, "meshes", "assets", mesh_filename)
+            
+            return None
+        except Exception as e:
+            print(f"Error getting mesh path for {body_name}: {e}")
+            return None
+
     def get_positive_ratio(self):
         num_pos = 0
         for d in self.arrangement_data:
@@ -226,6 +343,289 @@ class SemanticArrangementDataset(torch.utils.data.Dataset):
     def get_data_index(self, idx):
         filename = self.arrangement_data[idx]
         return filename
+
+    def get_raw_data_from_mujoco(self, model, data, target_object_names, goal_specification,
+                                  other_object_names=None, scene_xml_dir=".",
+                                  inference_mode=False, shuffle_object_index=False):
+        """
+        Get data from a MuJoCo scene instead of h5 file.
+        
+        @param model: MuJoCo model
+        @param data: MuJoCo data (current state)
+        @param target_object_names: List of target object body names
+        @param goal_specification: Goal specification dict (same format as h5)
+        @param other_object_names: List of other object body names (distractors/anchors)
+        @param scene_xml_dir: Directory where scene.xml is located
+        @param inference_mode: Whether in inference mode
+        @param shuffle_object_index: Whether to shuffle object indices
+        @return: datum dictionary
+        """
+        if other_object_names is None:
+            other_object_names = []
+        
+        num_rearrange_objs = len(target_object_names)
+        num_other_objs = len(other_object_names)
+        
+        assert num_rearrange_objs <= self.max_num_objects
+        assert num_other_objs <= self.max_num_other_objects
+        
+        all_objs = target_object_names + other_object_names
+        target_objs = target_object_names
+        other_objs = other_object_names
+        
+        structure_parameters = goal_specification["shape"]
+        
+        # Important: ensure the order is correct
+        if structure_parameters["type"] == "circle" or structure_parameters["type"] == "line":
+            target_objs = target_objs[::-1]
+        elif structure_parameters["type"] == "tower" or structure_parameters["type"] == "dinner":
+            target_objs = target_objs
+        else:
+            raise KeyError("{} structure is not recognized".format(structure_parameters["type"]))
+        all_objs = target_objs + other_objs
+        
+        ###################################
+        # getting object point clouds FROM MESH FILES
+        obj_pcs = []
+        obj_pad_mask = []
+        current_pc_poses = []
+        other_obj_pcs = []
+        other_obj_pad_mask = []
+        current_obj_poses = []
+        
+        for obj in all_objs:
+            # Get the current pose of the object from MuJoCo
+            body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, obj)
+            if body_id < 0:
+                print(f"Warning: Body {obj} not found in MuJoCo model")
+                continue
+            
+            current_pose = np.eye(4, dtype=np.float64)
+            # MuJoCo stores rotation matrix in row-major order
+            rot_mat = data.xmat[body_id].reshape(3, 3).copy()
+            
+            # Validate rotation matrix
+            det = np.linalg.det(rot_mat)
+            if abs(det - 1.0) > 0.1 or np.linalg.norm(rot_mat) < 0.1:
+                # Invalid rotation matrix, use identity
+                print(f"Warning: Invalid rotation matrix for {obj} (det={det:.4f}), using identity")
+                rot_mat = np.eye(3, dtype=np.float64)
+            
+            current_pose[:3, :3] = rot_mat
+            current_pose[:3, 3] = data.xpos[body_id].copy()
+            
+            # Get mesh file path for this object from MuJoCo
+            mesh_path = self._get_mesh_path_from_mujoco(model, obj, scene_xml_dir)
+            
+            if mesh_path is None or not os.path.exists(mesh_path):
+                print(f"Warning: Mesh file not found for {obj}, generating simple geometry")
+                # For non-mesh geoms (box, sphere, etc.), generate point cloud from primitive
+                obj_xyz = self._generate_pc_from_mujoco_geom(model, data, obj)
+            else:
+                # Load mesh and sample point cloud
+                obj_xyz = self._load_mesh_and_sample_pc(mesh_path, self.num_pts, apply_transform=current_pose)
+            
+            # Generate RGB values
+            if not self.ignore_rgb:
+                obj_rgb = torch.ones(self.num_pts, 3) * 0.5  # Gray color
+            
+            if obj in target_objs:
+                if self.ignore_rgb:
+                    obj_pcs.append(obj_xyz)
+                else:
+                    obj_pcs.append(torch.concat([obj_xyz, obj_rgb], dim=-1))
+                obj_pad_mask.append(0)
+                pc_pose = np.eye(4)
+                pc_pose[:3, 3] = torch.mean(obj_xyz, dim=0).numpy()
+                current_pc_poses.append(pc_pose)
+                current_obj_poses.append(current_pose)
+            elif obj in other_objs:
+                if self.ignore_rgb:
+                    other_obj_pcs.append(obj_xyz)
+                else:
+                    other_obj_pcs.append(torch.concat([obj_xyz, obj_rgb], dim=-1))
+                other_obj_pad_mask.append(0)
+            else:
+                raise Exception
+        
+        ###################################
+        # computes goal positions for objects
+        if self.use_virtual_structure_frame:
+            goal_structure_pose = tra.euler_matrix(structure_parameters["rotation"][0], 
+                                              structure_parameters["rotation"][1],
+                                              structure_parameters["rotation"][2])
+            goal_structure_pose[:3, 3] = [structure_parameters["position"][0], 
+                                     structure_parameters["position"][1],
+                                     structure_parameters["position"][2]]
+            goal_structure_pose_inv = np.linalg.inv(goal_structure_pose)
+        
+        # For MuJoCo, you need to provide goal poses separately
+        # This is a placeholder - you should set these based on your task
+        goal_obj_poses = []
+        goal_pc_poses = []
+        for current_pc_pose, current_obj_pose in zip(current_pc_poses, current_obj_poses):
+            # Placeholder: goal is same as current (you should modify this)
+            goal_pose = current_obj_pose.copy()
+            
+            # Compute transformation from current to goal
+            try:
+                current_obj_pose_inv = np.linalg.inv(current_obj_pose)
+                goal_pc_pose = goal_pose @ current_obj_pose_inv @ current_pc_pose
+            except np.linalg.LinAlgError:
+                # If matrix is singular, goal pose equals current pose
+                print(f"Warning: Singular matrix when computing goal pose, using identity transform")
+                goal_pc_pose = current_pc_pose.copy()
+            
+            if self.use_virtual_structure_frame:
+                goal_pc_pose = goal_structure_pose_inv @ goal_pc_pose
+            
+            goal_obj_poses.append(goal_pose)
+            goal_pc_poses.append(goal_pc_pose)
+        
+        ###################################
+        # preparing sentence
+        sentence = []
+        sentence_pad_mask = []
+        
+        if structure_parameters["type"] == "circle" or structure_parameters["type"] == "line":
+            sentence.append((structure_parameters["type"], "shape"))
+            sentence.append((structure_parameters["rotation"][2], "rotation"))
+            sentence.append((structure_parameters["position"][0], "position_x"))
+            sentence.append((structure_parameters["position"][1], "position_y"))
+            if structure_parameters["type"] == "circle":
+                sentence.append((structure_parameters["radius"], "radius"))
+            elif structure_parameters["type"] == "line":
+                sentence.append((structure_parameters["length"] / 2.0, "radius"))
+            for _ in range(5):
+                sentence_pad_mask.append(0)
+        else:
+            sentence.append((structure_parameters["type"], "shape"))
+            sentence.append((structure_parameters["rotation"][2], "rotation"))
+            sentence.append((structure_parameters["position"][0], "position_x"))
+            sentence.append((structure_parameters["position"][1], "position_y"))
+            for _ in range(4):
+                sentence_pad_mask.append(0)
+            sentence.append(("PAD", None))
+            sentence_pad_mask.append(1)
+        
+        ###################################
+        # paddings
+        for i in range(self.max_num_objects - len(target_objs)):
+            obj_pcs.append(torch.zeros_like(obj_pcs[0], dtype=torch.float32))
+            obj_pad_mask.append(1)
+            goal_pc_poses.append(np.eye(4))
+        
+        for i in range(self.max_num_other_objects - len(other_objs)):
+            other_obj_pcs.append(torch.zeros_like(obj_pcs[0], dtype=torch.float32))
+            other_obj_pad_mask.append(1)
+        
+        ###################################
+        # shuffle if needed
+        if shuffle_object_index:
+            shuffle_target_object_indices = list(range(len(target_objs)))
+            random.shuffle(shuffle_target_object_indices)
+            shuffle_object_indices = shuffle_target_object_indices + list(range(len(target_objs), self.max_num_objects))
+            obj_pcs = [obj_pcs[i] for i in shuffle_object_indices]
+            goal_pc_poses = [goal_pc_poses[i] for i in shuffle_object_indices]
+            if inference_mode:
+                goal_obj_poses = [goal_obj_poses[i] for i in shuffle_object_indices]
+                current_obj_poses = [current_obj_poses[i] for i in shuffle_object_indices]
+                target_objs = [target_objs[i] for i in shuffle_target_object_indices]
+                current_pc_poses = [current_pc_poses[i] for i in shuffle_object_indices]
+        
+        ###################################
+        # construct final datum
+        if self.use_virtual_structure_frame:
+            if self.ignore_distractor_objects:
+                pcs = obj_pcs
+                type_index = [0] * self.max_num_shape_parameters + [2] + [3] * self.max_num_objects
+                position_index = list(range(self.max_num_shape_parameters)) + [0] + list(range(self.max_num_objects))
+                pad_mask = sentence_pad_mask + [0] + obj_pad_mask
+            else:
+                pcs = other_obj_pcs + obj_pcs
+                type_index = [0] * self.max_num_shape_parameters + [1] * self.max_num_other_objects + [2] + [3] * self.max_num_objects
+                position_index = list(range(self.max_num_shape_parameters)) + list(range(self.max_num_other_objects)) + [0] + list(range(self.max_num_objects))
+                pad_mask = sentence_pad_mask + other_obj_pad_mask + [0] + obj_pad_mask
+            goal_poses = [goal_structure_pose] + goal_pc_poses
+        else:
+            if self.ignore_distractor_objects:
+                pcs = obj_pcs
+                type_index = [0] * self.max_num_shape_parameters + [3] * self.max_num_objects
+                position_index = list(range(self.max_num_shape_parameters)) + list(range(self.max_num_objects))
+                pad_mask = sentence_pad_mask + obj_pad_mask
+            else:
+                pcs = other_obj_pcs + obj_pcs
+                type_index = [0] * self.max_num_shape_parameters + [1] * self.max_num_other_objects + [3] * self.max_num_objects
+                position_index = list(range(self.max_num_shape_parameters)) + list(range(self.max_num_other_objects)) + list(range(self.max_num_objects))
+                pad_mask = sentence_pad_mask + other_obj_pad_mask + obj_pad_mask
+            goal_poses = goal_pc_poses
+        
+        datum = {
+            "pcs": pcs,
+            "sentence": sentence,
+            "goal_poses": goal_poses,
+            "type_index": type_index,
+            "position_index": position_index,
+            "pad_mask": pad_mask,
+            "t": num_rearrange_objs,
+            "filename": "mujoco_scene"
+        }
+        
+        if inference_mode:
+            datum["goal_obj_poses"] = goal_obj_poses
+            datum["current_obj_poses"] = current_obj_poses
+            datum["target_objs"] = target_objs
+            datum["goal_specification"] = goal_specification
+            datum["current_pc_poses"] = current_pc_poses
+        
+        return datum
+    
+    def _generate_pc_from_mujoco_geom(self, model, data, body_name):
+        """
+        Generate point cloud from MuJoCo primitive geom (box, sphere, etc.).
+        
+        @param model: MuJoCo model
+        @param data: MuJoCo data
+        @param body_name: Body name
+        @return: Point cloud tensor
+        """
+        body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, body_name)
+        if body_id < 0:
+            return torch.randn(self.num_pts, 3) * 0.1
+        
+        # Get body pose
+        obj_pose = np.eye(4, dtype=np.float64)
+        rot_mat = data.xmat[body_id].reshape(3, 3).copy()
+        
+        # Validate rotation matrix
+        det = np.linalg.det(rot_mat)
+        if abs(det - 1.0) > 0.1 or np.linalg.norm(rot_mat) < 0.1:
+            rot_mat = np.eye(3, dtype=np.float64)
+        
+        obj_pose[:3, :3] = rot_mat
+        obj_pose[:3, 3] = data.xpos[body_id]
+        
+        # Find geom and generate primitive
+        for geom_id in range(model.ngeom):
+            if model.geom_bodyid[geom_id] == body_id:
+                geom_type = model.geom_type[geom_id]
+                geom_size = model.geom_size[geom_id]
+                
+                if geom_type == mujoco.mjtGeom.mjGEOM_BOX:
+                    box = trimesh.creation.box(extents=geom_size * 2)
+                    points, _ = trimesh.sample.sample_surface(box, count=self.num_pts)
+                elif geom_type == mujoco.mjtGeom.mjGEOM_SPHERE:
+                    sphere = trimesh.creation.icosphere(subdivisions=2, radius=geom_size[0])
+                    points, _ = trimesh.sample.sample_surface(sphere, count=self.num_pts)
+                else:
+                    # Fallback to random points
+                    points = np.random.randn(self.num_pts, 3) * 0.05
+                
+                # Transform to world frame
+                points = trimesh.transform_points(points, obj_pose)
+                return torch.FloatTensor(points)
+        
+        return torch.randn(self.num_pts, 3) * 0.1
 
     def get_raw_data(self, idx, inference_mode=False, shuffle_object_index=False):
         """
@@ -266,25 +666,37 @@ class SemanticArrangementDataset(torch.utils.data.Dataset):
         all_objs = target_objs + other_objs
 
         ###################################
-        # getting scene images and point clouds
-        scene = self._get_images(h5, step_t, ee=True)
-        rgb, depth, seg, valid, xyz = scene
+        # getting scene images and point clouds (for inference mode compatibility)
         if inference_mode:
+            scene = self._get_images(h5, step_t, ee=True)
+            rgb, depth, seg, valid, xyz = scene
             initial_scene = scene
+        else:
+            # For training, we don't need the full scene rendering
+            rgb = None
 
-        # getting object point clouds
+        # getting object point clouds FROM MESH FILES
         obj_pcs = []
         obj_pad_mask = []
         current_pc_poses = []
         other_obj_pcs = []
         other_obj_pad_mask = []
+        
         for obj in all_objs:
-            obj_mask = np.logical_and(seg == ids[obj], valid)
-            if np.sum(obj_mask) <= 0:
-                raise Exception
-            ok, obj_xyz, obj_rgb, _ = get_pts(xyz, rgb, obj_mask, num_pts=self.num_pts)
-            if not ok:
-                raise Exception
+            # Get the current pose of the object from h5 file
+            current_pose = h5[obj][step_t]
+            
+            # Get mesh file path for this object
+            mesh_path = self._get_mesh_path_for_object(h5, obj)
+            
+            # Load mesh and sample point cloud
+            # The mesh is loaded in its canonical pose, then transformed to current pose
+            obj_xyz = self._load_mesh_and_sample_pc(mesh_path, self.num_pts, apply_transform=current_pose)
+            
+            # Generate RGB values (can be loaded from mesh if available, or use defaults)
+            if not self.ignore_rgb:
+                # Default: use a neutral color or extract from mesh material
+                obj_rgb = torch.ones(self.num_pts, 3) * 0.5  # Gray color
 
             if obj in target_objs:
                 if self.ignore_rgb:
