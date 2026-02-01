@@ -222,7 +222,6 @@ class SemanticArrangementDataset(torch.utils.data.Dataset):
         """
         try:
             # Load mesh from OBJ file
-            pdb.set_trace()
             mesh = trimesh.load(mesh_path, force='mesh')
             
             # Sample points on the surface (uniform by area)
@@ -297,6 +296,8 @@ class SemanticArrangementDataset(torch.utils.data.Dataset):
         @param scene_xml_dir: Directory where the scene XML is located
         @return: Path to mesh file or None if not a mesh geom
         """
+        import xml.etree.ElementTree as ET
+        
         try:
             # Find the body
             body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, body_name)
@@ -311,17 +312,59 @@ class SemanticArrangementDataset(torch.utils.data.Dataset):
                     # Check if it's a mesh geom
                     if geom_type == mujoco.mjtGeom.mjGEOM_MESH:
                         mesh_id = model.geom_dataid[geom_id]
-                        # Get mesh file path from model
-                        # MuJoCo stores mesh paths in the compiled model
-                        # We need to extract it from the mesh name and asset path
-                        mesh_name_adr = model.name_meshadr[mesh_id]
-                        mesh_name = model.names[mesh_name_adr:].decode('utf-8').split('\x00')[0]
                         
-                        # Find corresponding asset file
-                        # The mesh file is typically defined in the XML <asset> section
-                        # For now, construct path from mesh name
-                        mesh_filename = f"{mesh_name.replace('_mesh', '')}.obj"
-                        return os.path.join(scene_xml_dir, "meshes", "assets", mesh_filename)
+                        # Get mesh name from MuJoCo model
+                        if mesh_id >= 0 and mesh_id < model.nmesh:
+                            mesh_name_adr = model.name_meshadr[mesh_id]
+                            mesh_name = model.names[mesh_name_adr:].decode('utf-8').split('\x00')[0]
+                            
+                            # Parse scene XML to find the mesh file path and meshdir
+                            scene_xml_path = os.path.join(scene_xml_dir, "scene.xml")
+                            if os.path.exists(scene_xml_path):
+                                tree = ET.parse(scene_xml_path)
+                                root = tree.getroot()
+                                
+                                # Check for meshdir in compiler settings (including in included files)
+                                meshdir = ""
+                                
+                                # First check scene.xml itself
+                                for compiler_elem in root.findall(".//compiler"):
+                                    meshdir_attr = compiler_elem.get("meshdir")
+                                    if meshdir_attr:
+                                        meshdir = meshdir_attr
+                                
+                                # Also check included files for compiler/meshdir
+                                for include_elem in root.findall(".//include"):
+                                    include_file = include_elem.get("file")
+                                    if include_file:
+                                        include_path = os.path.join(scene_xml_dir, include_file)
+                                        if os.path.exists(include_path):
+                                            try:
+                                                include_tree = ET.parse(include_path)
+                                                include_root = include_tree.getroot()
+                                                for compiler_elem in include_root.findall(".//compiler"):
+                                                    meshdir_attr = compiler_elem.get("meshdir")
+                                                    if meshdir_attr:
+                                                        meshdir = meshdir_attr
+                                            except:
+                                                pass
+                                
+                                # Find mesh asset with matching name
+                                for mesh_elem in root.findall(".//asset/mesh"):
+                                    if mesh_elem.get("name") == mesh_name:
+                                        file_path = mesh_elem.get("file")
+                                        if file_path:
+                                            # Resolve relative paths
+                                            if file_path.startswith('./'):
+                                                file_path = file_path[2:]
+                                            
+                                            # Apply meshdir if present
+                                            if meshdir:
+                                                file_path = os.path.join(meshdir, file_path)
+                                            
+                                            # Construct absolute path
+                                            abs_path = os.path.join(scene_xml_dir, file_path)
+                                            return abs_path if os.path.exists(abs_path) else None
             
             return None
         except Exception as e:
@@ -364,6 +407,9 @@ class SemanticArrangementDataset(torch.utils.data.Dataset):
         """
         if other_object_names is None:
             other_object_names = []
+        
+        # Update MuJoCo state to ensure xmat and xpos are computed
+        mujoco.mj_forward(model, data)
         
         num_rearrange_objs = len(target_object_names)
         num_other_objs = len(other_object_names)
