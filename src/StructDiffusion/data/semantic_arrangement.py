@@ -20,6 +20,7 @@ import StructDiffusion.utils.brain2.camera as cam
 import StructDiffusion.utils.brain2.image as img
 import StructDiffusion.utils.transformations as tra
 
+import pdb
 
 class SemanticArrangementDataset(torch.utils.data.Dataset):
 
@@ -221,6 +222,7 @@ class SemanticArrangementDataset(torch.utils.data.Dataset):
         """
         try:
             # Load mesh from OBJ file
+            pdb.set_trace()
             mesh = trimesh.load(mesh_path, force='mesh')
             
             # Sample points on the surface (uniform by area)
